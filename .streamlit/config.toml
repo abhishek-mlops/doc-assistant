@@ -1,0 +1,7 @@
+[server]
+headless = true
+# NOTE: a bare `port = $PORT` is not valid TOML and would crash Streamlit at startup.
+# Streamlit Community Cloud assigns the port automatically, so no line is needed there.
+# On platforms that inject $PORT (Render, Railway, Heroku...), start the app with:
+#   streamlit run app.py --server.port $PORT
+# or set the env var STREAMLIT_SERVER_PORT=$PORT.

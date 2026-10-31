@@ -1,0 +1,359 @@
+"""Document Assistant - RAG Chatbot
+
+Streamlit + Groq (openai/gpt-oss-120b) + sentence-transformers + FAISS.
+No LangChain, no LlamaIndex, no external vector DB.
+"""
+
+import hashlib
+import io
+import os
+import re
+
+import faiss
+import numpy as np
+import streamlit as st
+from groq import Groq
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
+
+# ----------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------
+LLM_MODEL = "openai/gpt-oss-120b"
+EMBED_MODEL = "all-MiniLM-L6-v2"
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
+TOP_K = 3
+EMBED_BATCH_SIZE = 32
+
+st.set_page_config(page_title="Document Assistant – RAG Chatbot", page_icon="📄", layout="wide")
+
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+def get_groq_api_key():
+    """Read GROQ_API_KEY from st.secrets, falling back to os.environ."""
+    try:
+        key = st.secrets["GROQ_API_KEY"]
+        if key:
+            return key
+    except Exception:
+        # No secrets file or key missing -> fall back to environment variable.
+        pass
+    return os.environ.get("GROQ_API_KEY")
+
+
+@st.cache_resource(show_spinner="Loading embedding model (first run only)...")
+def load_embedder():
+    """Load the sentence-transformers model once per server process."""
+    return SentenceTransformer(EMBED_MODEL)
+
+
+@st.cache_resource
+def get_groq_client(api_key):
+    return Groq(api_key=api_key)
+
+
+def extract_text_from_pdf(file_bytes, progress_cb=None):
+    """Extract text from every page of a PDF. Returns the full text."""
+    reader = PdfReader(io.BytesIO(file_bytes))
+    total_pages = len(reader.pages)
+    pages_text = []
+    for i, page in enumerate(reader.pages):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        pages_text.append(text)
+        if progress_cb:
+            progress_cb((i + 1) / max(total_pages, 1))
+    return "\n\n".join(pages_text)
+
+
+def sliding_window(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Split a long string into `size`-char windows with `overlap`-char overlap."""
+    pieces = []
+    step = size - overlap
+    start = 0
+    while start < len(text):
+        piece = text[start:start + size].strip()
+        if piece:
+            pieces.append(piece)
+        if start + size >= len(text):
+            break
+        start += step
+    return pieces
+
+
+def split_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Split by paragraphs first, then into ~500-char chunks with 50-char overlap.
+
+    - Paragraphs are separated by blank lines.
+    - Short paragraphs are merged together until a chunk would exceed `size`.
+    - Paragraphs longer than `size` are cut into overlapping windows.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    raw_paragraphs = re.split(r"\n\s*\n", text)
+    paragraphs = []
+    for p in raw_paragraphs:
+        cleaned = re.sub(r"\s+", " ", p).strip()
+        if cleaned:
+            paragraphs.append(cleaned)
+
+    chunks = []
+    buffer = ""
+
+    for para in paragraphs:
+        if len(para) > size:
+            # Flush whatever is buffered, then window the long paragraph.
+            if buffer:
+                chunks.append(buffer)
+                buffer = ""
+            chunks.extend(sliding_window(para, size, overlap))
+        elif not buffer:
+            buffer = para
+        elif len(buffer) + 1 + len(para) <= size:
+            buffer = buffer + " " + para
+        else:
+            chunks.append(buffer)
+            buffer = para
+
+    if buffer:
+        chunks.append(buffer)
+
+    return chunks
+
+
+def embed_texts(embedder, texts, progress_cb=None):
+    """Embed texts in batches; returns a float32 array of L2-normalised vectors."""
+    all_vecs = []
+    total = len(texts)
+    for start in range(0, total, EMBED_BATCH_SIZE):
+        batch = texts[start:start + EMBED_BATCH_SIZE]
+        vecs = embedder.encode(batch, convert_to_numpy=True, normalize_embeddings=True)
+        all_vecs.append(vecs)
+        if progress_cb:
+            progress_cb(min(start + EMBED_BATCH_SIZE, total) / total)
+    return np.vstack(all_vecs).astype("float32")
+
+
+def build_faiss_index(embeddings):
+    """Inner-product index on normalised vectors == cosine similarity."""
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    return index
+
+
+def retrieve(question, k=TOP_K):
+    """Return a list of (chunk_number, chunk_text, score) for the top-k chunks."""
+    embedder = load_embedder()
+    q_vec = embedder.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+    k = min(k, st.session_state.index.ntotal)
+    scores, ids = st.session_state.index.search(q_vec, k)
+    results = []
+    for score, idx in zip(scores[0], ids[0]):
+        if idx == -1:
+            continue
+        results.append((int(idx) + 1, st.session_state.chunks[int(idx)], float(score)))
+    return results
+
+
+def build_prompt(question, retrieved):
+    context = "\n\n".join(f"[Chunk {num}] {text}" for num, text, _ in retrieved)
+    return (
+        "Answer using ONLY the context below. Cite the chunk number.\n"
+        "If the answer is not in the context, say you could not find it in the document.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}"
+    )
+
+
+def ask_groq(client, prompt):
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful document assistant. You answer strictly from the provided context.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+        max_tokens=4096,
+    )
+    return response.choices[0].message.content
+
+
+def reset_document_state():
+    st.session_state.chunks = []
+    st.session_state.index = None
+    st.session_state.file_hash = None
+    st.session_state.file_name = None
+    st.session_state.messages = []
+
+
+# ----------------------------------------------------------------------------
+# Session state
+# ----------------------------------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+if "index" not in st.session_state:
+    st.session_state.index = None
+if "file_hash" not in st.session_state:
+    st.session_state.file_hash = None
+if "file_name" not in st.session_state:
+    st.session_state.file_name = None
+
+# ----------------------------------------------------------------------------
+# Sidebar
+# ----------------------------------------------------------------------------
+with st.sidebar:
+    st.header("📊 Status")
+    st.metric("Chunks indexed", len(st.session_state.chunks))
+    st.markdown(f"**LLM:** `{LLM_MODEL}`")
+    st.markdown(f"**Embeddings:** `{EMBED_MODEL}`")
+    if st.session_state.file_name:
+        st.markdown(f"**Document:** {st.session_state.file_name}")
+
+    if st.button("🗑️ Clear Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+    with st.expander("ℹ️ How it works"):
+        st.markdown(
+            f"""
+1. **Upload** a PDF. Text is extracted with PyPDF2.
+2. The text is **split** by paragraphs, then into ~{CHUNK_SIZE}-character
+   chunks with {CHUNK_OVERLAP}-character overlap.
+3. Each chunk is **embedded** locally with `{EMBED_MODEL}`.
+4. Embeddings are stored in an in-memory **FAISS** index.
+5. Your question is embedded and the **top {TOP_K}** most similar chunks are retrieved.
+6. Those chunks are sent to **Groq** (`{LLM_MODEL}`) with an instruction to
+   answer only from the context and cite chunk numbers.
+7. The answer is shown along with the source chunks.
+"""
+        )
+
+# ----------------------------------------------------------------------------
+# Main page
+# ----------------------------------------------------------------------------
+st.title("📄 Document Assistant – RAG Chatbot")
+st.caption("Upload a PDF and ask questions about it. Answers are grounded in the document.")
+
+api_key = get_groq_api_key()
+if not api_key:
+    st.error(
+        "GROQ_API_KEY not found. Add it to `.streamlit/secrets.toml` (or Streamlit Cloud secrets), "
+        "or export it as an environment variable."
+    )
+    st.stop()
+
+uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+
+if uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    current_hash = hashlib.md5(file_bytes).hexdigest()
+
+    # New upload (different content) -> reset everything and re-index.
+    if current_hash != st.session_state.file_hash:
+        reset_document_state()
+
+        progress = st.progress(0.0, text="Reading PDF...")
+        try:
+            raw_text = extract_text_from_pdf(
+                file_bytes,
+                progress_cb=lambda f: progress.progress(f * 0.3, text="Reading PDF pages..."),
+            )
+        except Exception as e:
+            progress.empty()
+            st.error(f"Could not read this PDF: {e}")
+            st.stop()
+
+        if not raw_text or not raw_text.strip():
+            progress.empty()
+            st.warning(
+                "⚠️ This PDF is empty or has no extractable text. "
+                "It may be a scanned document (images only) — try a PDF with selectable text."
+            )
+            st.stop()
+
+        progress.progress(0.3, text="Splitting text into chunks...")
+        chunks = split_text(raw_text)
+
+        if not chunks:
+            progress.empty()
+            st.warning("⚠️ No usable text chunks could be created from this PDF.")
+            st.stop()
+
+        progress.progress(0.35, text=f"Embedding {len(chunks)} chunks...")
+        embedder = load_embedder()
+        embeddings = embed_texts(
+            embedder,
+            chunks,
+            progress_cb=lambda f: progress.progress(0.35 + f * 0.6, text=f"Embedding {len(chunks)} chunks..."),
+        )
+
+        progress.progress(0.97, text="Building FAISS index...")
+        index = build_faiss_index(embeddings)
+
+        st.session_state.chunks = chunks
+        st.session_state.index = index
+        st.session_state.file_hash = current_hash
+        st.session_state.file_name = uploaded_file.name
+
+        progress.progress(1.0, text="Done!")
+        progress.empty()
+        st.success(f"✅ Indexed **{len(chunks)}** chunks from **{uploaded_file.name}**.")
+        st.rerun()
+
+# ----------------------------------------------------------------------------
+# Chat
+# ----------------------------------------------------------------------------
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg["role"] == "assistant" and msg.get("sources"):
+            nums = ", ".join(str(n) for n, _, _ in msg["sources"])
+            st.caption(f"📚 Source chunks: {nums}")
+            with st.expander("View source chunks"):
+                for num, text, score in msg["sources"]:
+                    st.markdown(f"**Chunk {num}** (similarity: {score:.3f})")
+                    st.text(text)
+
+if st.session_state.index is None:
+    st.info("👆 Upload a PDF to start chatting.")
+
+question = st.chat_input(
+    "Ask a question about your document...",
+    disabled=st.session_state.index is None,
+)
+
+if question:
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Searching document and thinking..."):
+            try:
+                retrieved = retrieve(question, TOP_K)
+                prompt = build_prompt(question, retrieved)
+                client = get_groq_client(api_key)
+                answer = ask_groq(client, prompt)
+            except Exception as e:
+                retrieved = []
+                answer = f"⚠️ Something went wrong while generating the answer: `{e}`"
+
+        st.markdown(answer)
+        if retrieved:
+            nums = ", ".join(str(n) for n, _, _ in retrieved)
+            st.caption(f"📚 Source chunks: {nums}")
+            with st.expander("View source chunks"):
+                for num, text, score in retrieved:
+                    st.markdown(f"**Chunk {num}** (similarity: {score:.3f})")
+                    st.text(text)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer, "sources": retrieved})

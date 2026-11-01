@@ -23,7 +23,7 @@ LLM_MODEL = "openai/gpt-oss-120b"
 EMBED_MODEL = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
-TOP_K = 3
+TOP_K = 8
 EMBED_BATCH_SIZE = 32
 
 st.set_page_config(page_title="Document Assistant", page_icon="📄", layout="wide")
@@ -163,49 +163,100 @@ def build_faiss_index(embeddings):
     return index
 
 
+def is_broad_question(question):
+    q = question.lower()
+    return any(
+        phrase in q
+        for phrase in (
+            "summar",
+            "overview",
+            "key point",
+            "main point",
+            "important term",
+            "this document",
+            "this pdf",
+            "what is this",
+        )
+    )
+
+
 def retrieve(question, k=TOP_K):
     """Return a list of (chunk_number, chunk_text, score) for the top-k chunks."""
+    chunks = st.session_state.chunks
+    embeddings = np.asarray(st.session_state.embeddings, dtype="float32")
+    if embeddings.ndim != 2 or len(chunks) == 0:
+        return []
+
+    # Rebuild FAISS from stored vectors. The C++ index itself does not survive Streamlit reruns.
+    index = build_faiss_index(embeddings)
     embedder = load_embedder()
     q_vec = embedder.encode([question], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-    k = min(k, st.session_state.index.ntotal)
-    scores, ids = st.session_state.index.search(q_vec, k)
+
+    if is_broad_question(question):
+        k = min(max(k, 12), len(chunks))
+    k = min(k, len(chunks))
+    scores, ids = index.search(q_vec, k)
+
     results = []
+    seen = set()
     for score, idx in zip(scores[0], ids[0]):
-        if idx == -1:
+        idx = int(idx)
+        if idx < 0 or idx in seen:
             continue
-        results.append((int(idx) + 1, st.session_state.chunks[int(idx)], float(score)))
+        seen.add(idx)
+        results.append((idx + 1, chunks[idx], float(score)))
+
+    # Summaries need the start of the PDF, not only the closest 8 snippets.
+    if is_broad_question(question):
+        for idx, text in enumerate(chunks[:8]):
+            if idx not in seen:
+                seen.add(idx)
+                results.append((idx + 1, text, 0.0))
     return results
 
 
 def build_prompt(question, retrieved):
     context = "\n\n".join(f"[Chunk {num}] {text}" for num, text, _ in retrieved)
     return (
-        "Answer using ONLY the context below. Cite the chunk number.\n"
-        "If the answer is not in the context, say you could not find it in the document.\n\n"
-        f"Context:\n{context}\n\n"
+        "The passages below are excerpts from the user's uploaded PDF.\n"
+        "Answer the question using these passages. Combine them if needed. Cite chunk numbers.\n"
+        "If they only partly match, still answer from what is there.\n"
+        "Say you could not find it only when the passages are clearly about something else.\n\n"
+        f"Passages:\n{context}\n\n"
         f"Question: {question}"
     )
 
 
 def ask_groq(client, prompt):
-    response = client.chat.completions.create(
+    kwargs = dict(
         model=LLM_MODEL,
         messages=[
             {
                 "role": "system",
-                "content": "You are a helpful document assistant. You answer strictly from the provided context.",
+                "content": (
+                    "You help users understand an uploaded document. "
+                    "Use the given passages. Be specific. Do not refuse a summary or overview "
+                    "when passages from the document are provided."
+                ),
             },
             {"role": "user", "content": prompt},
         ],
-        temperature=0.1,
+        temperature=0.2,
         max_tokens=4096,
     )
-    return response.choices[0].message.content
+    try:
+        kwargs["reasoning_effort"] = "low"
+        response = client.chat.completions.create(**kwargs)
+    except TypeError:
+        kwargs.pop("reasoning_effort", None)
+        response = client.chat.completions.create(**kwargs)
+    content = response.choices[0].message.content
+    return (content or "").strip()
 
 
 def reset_document_state():
     st.session_state.chunks = []
-    st.session_state.index = None
+    st.session_state.embeddings = None
     st.session_state.file_hash = None
     st.session_state.file_name = None
     st.session_state.messages = []
@@ -218,8 +269,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
-if "index" not in st.session_state:
-    st.session_state.index = None
+if "embeddings" not in st.session_state:
+    st.session_state.embeddings = None
 if "file_hash" not in st.session_state:
     st.session_state.file_hash = None
 if "file_name" not in st.session_state:
@@ -246,7 +297,7 @@ with st.sidebar:
             st.session_state.messages = []
             st.rerun()
     with col_b:
-        if st.button("Remove PDF", use_container_width=True, disabled=st.session_state.index is None):
+        if st.button("Remove PDF", use_container_width=True, disabled=not st.session_state.chunks):
             reset_document_state()
             st.rerun()
 
@@ -294,9 +345,8 @@ if uploaded_file is not None:
             chunks,
             progress_cb=lambda f: progress.progress(0.35 + f * 0.6, text="Indexing..."),
         )
-        index = build_faiss_index(embeddings)
         st.session_state.chunks = chunks
-        st.session_state.index = index
+        st.session_state.embeddings = embeddings
         st.session_state.file_hash = current_hash
         st.session_state.file_name = uploaded_file.name
         progress.empty()
@@ -307,7 +357,7 @@ if uploaded_file is not None:
 # ----------------------------------------------------------------------------
 st.title("Document Assistant")
 
-ready = st.session_state.index is not None
+ready = st.session_state.embeddings is not None and len(st.session_state.chunks) > 0
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -351,9 +401,14 @@ if question:
         with st.spinner("Thinking…"):
             try:
                 retrieved = retrieve(question, TOP_K)
-                prompt = build_prompt(question, retrieved)
-                client = get_groq_client(api_key)
-                answer = ask_groq(client, prompt)
+                if not retrieved:
+                    answer = "The document was indexed, but no matching text was retrieved. Try another question."
+                else:
+                    prompt = build_prompt(question, retrieved)
+                    client = get_groq_client(api_key)
+                    answer = ask_groq(client, prompt)
+                    if not answer:
+                        answer = "The model returned an empty reply. Please try the question again."
             except Exception as e:
                 retrieved = []
                 answer = f"Could not generate an answer: `{e}`"

@@ -26,7 +26,25 @@ CHUNK_OVERLAP = 50
 TOP_K = 3
 EMBED_BATCH_SIZE = 32
 
-st.set_page_config(page_title="Document Assistant – RAG Chatbot", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Document Assistant", page_icon="📄", layout="wide")
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 1.4rem; padding-bottom: 6rem; max-width: 920px; }
+    [data-testid="stSidebar"] { min-width: 280px; }
+    .hint-row .stButton > button {
+        width: 100%;
+        border-radius: 999px;
+        border: 1px solid rgba(128,128,128,.35);
+        background: transparent;
+        font-weight: 500;
+    }
+    .hint-row .stButton > button:hover { border-color: #ff4b4b; color: #ff4b4b; }
+    header [data-testid="stToolbar"] { visibility: hidden; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ----------------------------------------------------------------------------
@@ -206,66 +224,52 @@ if "file_hash" not in st.session_state:
     st.session_state.file_hash = None
 if "file_name" not in st.session_state:
     st.session_state.file_name = None
+if "pending_question" not in st.session_state:
+    st.session_state.pending_question = None
+
+api_key = get_groq_api_key()
 
 # ----------------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------------
 with st.sidebar:
-    st.header("📊 Status")
-    st.metric("Chunks indexed", len(st.session_state.chunks))
-    st.markdown(f"**LLM:** `{LLM_MODEL}`")
-    st.markdown(f"**Embeddings:** `{EMBED_MODEL}`")
+    st.subheader("Document")
+    uploaded_file = st.file_uploader("PDF", type=["pdf"], label_visibility="collapsed")
+
     if st.session_state.file_name:
-        st.markdown(f"**Document:** {st.session_state.file_name}")
+        st.caption(st.session_state.file_name)
+        st.metric("Chunks", len(st.session_state.chunks))
 
-    if st.button("🗑️ Clear Chat", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Clear chat", use_container_width=True, disabled=not st.session_state.messages):
+            st.session_state.messages = []
+            st.rerun()
+    with col_b:
+        if st.button("Remove PDF", use_container_width=True, disabled=st.session_state.index is None):
+            reset_document_state()
+            st.rerun()
 
-    with st.expander("ℹ️ How it works"):
-        st.markdown(
-            f"""
-1. **Upload** a PDF. Text is extracted with PyPDF2.
-2. The text is **split** by paragraphs, then into ~{CHUNK_SIZE}-character
-   chunks with {CHUNK_OVERLAP}-character overlap.
-3. Each chunk is **embedded** locally with `{EMBED_MODEL}`.
-4. Embeddings are stored in an in-memory **FAISS** index.
-5. Your question is embedded and the **top {TOP_K}** most similar chunks are retrieved.
-6. Those chunks are sent to **Groq** (`{LLM_MODEL}`) with an instruction to
-   answer only from the context and cite chunk numbers.
-7. The answer is shown along with the source chunks.
-"""
-        )
+    if not api_key:
+        st.error("Add GROQ_API_KEY in secrets to chat.")
 
 # ----------------------------------------------------------------------------
-# Main page
+# Index upload
 # ----------------------------------------------------------------------------
-st.title("📄 Document Assistant – RAG Chatbot")
-st.caption("Upload a PDF and ask questions about it. Answers are grounded in the document.")
-
-api_key = get_groq_api_key()
 if not api_key:
-    st.error(
-        "GROQ_API_KEY not found. Add it to `.streamlit/secrets.toml` (or Streamlit Cloud secrets), "
-        "or export it as an environment variable."
-    )
     st.stop()
-
-uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.getvalue()
     current_hash = hashlib.md5(file_bytes).hexdigest()
 
-    # New upload (different content) -> reset everything and re-index.
     if current_hash != st.session_state.file_hash:
         reset_document_state()
-
         progress = st.progress(0.0, text="Reading PDF...")
         try:
             raw_text = extract_text_from_pdf(
                 file_bytes,
-                progress_cb=lambda f: progress.progress(f * 0.3, text="Reading PDF pages..."),
+                progress_cb=lambda f: progress.progress(f * 0.3, text="Reading PDF..."),
             )
         except Exception as e:
             progress.empty()
@@ -274,70 +278,77 @@ if uploaded_file is not None:
 
         if not raw_text or not raw_text.strip():
             progress.empty()
-            st.warning(
-                "⚠️ This PDF is empty or has no extractable text. "
-                "It may be a scanned document (images only) — try a PDF with selectable text."
-            )
+            st.warning("This PDF has no selectable text. Try a text PDF, not a scan.")
             st.stop()
 
-        progress.progress(0.3, text="Splitting text into chunks...")
+        progress.progress(0.3, text="Indexing...")
         chunks = split_text(raw_text)
-
         if not chunks:
             progress.empty()
-            st.warning("⚠️ No usable text chunks could be created from this PDF.")
+            st.warning("No usable text found in this PDF.")
             st.stop()
 
-        progress.progress(0.35, text=f"Embedding {len(chunks)} chunks...")
         embedder = load_embedder()
         embeddings = embed_texts(
             embedder,
             chunks,
-            progress_cb=lambda f: progress.progress(0.35 + f * 0.6, text=f"Embedding {len(chunks)} chunks..."),
+            progress_cb=lambda f: progress.progress(0.35 + f * 0.6, text="Indexing..."),
         )
-
-        progress.progress(0.97, text="Building FAISS index...")
         index = build_faiss_index(embeddings)
-
         st.session_state.chunks = chunks
         st.session_state.index = index
         st.session_state.file_hash = current_hash
         st.session_state.file_name = uploaded_file.name
-
-        progress.progress(1.0, text="Done!")
         progress.empty()
-        st.success(f"✅ Indexed **{len(chunks)}** chunks from **{uploaded_file.name}**.")
         st.rerun()
 
 # ----------------------------------------------------------------------------
 # Chat
 # ----------------------------------------------------------------------------
+st.title("Document Assistant")
+
+ready = st.session_state.index is not None
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg["role"] == "assistant" and msg.get("sources"):
-            nums = ", ".join(str(n) for n, _, _ in msg["sources"])
-            st.caption(f"📚 Source chunks: {nums}")
-            with st.expander("View source chunks"):
+            with st.expander(f"Sources · chunks {', '.join(str(n) for n, _, _ in msg['sources'])}"):
                 for num, text, score in msg["sources"]:
-                    st.markdown(f"**Chunk {num}** (similarity: {score:.3f})")
+                    st.markdown(f"**Chunk {num}** · {score:.2f}")
                     st.text(text)
 
-if st.session_state.index is None:
-    st.info("👆 Upload a PDF to start chatting.")
+if ready and not st.session_state.messages:
+    st.markdown('<div class="hint-row">', unsafe_allow_html=True)
+    hint_cols = st.columns(3)
+    for col, hint in zip(
+        hint_cols,
+        ("Summarize this document", "What are the key points?", "List important terms"),
+    ):
+        if col.button(hint, use_container_width=True):
+            st.session_state.pending_question = hint
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
 question = st.chat_input(
-    "Ask a question about your document...",
-    disabled=st.session_state.index is None,
+    "Ask about the PDF…" if ready else "Upload a PDF in the sidebar to start",
+    disabled=not ready,
 )
+if st.session_state.pending_question:
+    question = st.session_state.pending_question
+    st.session_state.pending_question = None
 
 if question:
+    if not ready:
+        st.warning("Upload a PDF first.")
+        st.stop()
+
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching document and thinking..."):
+        with st.spinner("Thinking…"):
             try:
                 retrieved = retrieve(question, TOP_K)
                 prompt = build_prompt(question, retrieved)
@@ -345,15 +356,13 @@ if question:
                 answer = ask_groq(client, prompt)
             except Exception as e:
                 retrieved = []
-                answer = f"⚠️ Something went wrong while generating the answer: `{e}`"
+                answer = f"Could not generate an answer: `{e}`"
 
         st.markdown(answer)
         if retrieved:
-            nums = ", ".join(str(n) for n, _, _ in retrieved)
-            st.caption(f"📚 Source chunks: {nums}")
-            with st.expander("View source chunks"):
+            with st.expander(f"Sources · chunks {', '.join(str(n) for n, _, _ in retrieved)}"):
                 for num, text, score in retrieved:
-                    st.markdown(f"**Chunk {num}** (similarity: {score:.3f})")
+                    st.markdown(f"**Chunk {num}** · {score:.2f}")
                     st.text(text)
 
     st.session_state.messages.append({"role": "assistant", "content": answer, "sources": retrieved})

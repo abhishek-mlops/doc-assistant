@@ -49,6 +49,8 @@ ASCII version:
 .
 ├── app.py
 ├── requirements.txt
+├── Dockerfile
+├── .dockerignore
 ├── README.md
 └── .streamlit/
     └── config.toml
@@ -131,6 +133,70 @@ GROQ_API_KEY = "gsk_your_key_here"
 5. The app restarts automatically and picks up the key.
 
 The app reads the key with `st.secrets["GROQ_API_KEY"]` and falls back to `os.environ["GROQ_API_KEY"]` for local development.
+
+## Traditional cloud: deploy on GCP (Cloud Run + Docker)
+
+This is the **traditional cloud** path for this project: a Docker image hosted on **Google Cloud Run**, API key as a runtime secret, HTTPS URL from GCP. (You need a GCP project with billing enabled.)
+
+```mermaid
+flowchart LR
+    U[User browser] --> CR[Cloud Run HTTPS URL]
+    CR --> D[Docker: Streamlit RAG app]
+    D --> G[Groq API]
+```
+
+### 1. Build and test the image locally (optional)
+
+```bash
+docker build -t doc-assistant .
+docker run --rm -p 8080:8080 -e GROQ_API_KEY="gsk_your_key_here" doc-assistant
+```
+
+Open <http://localhost:8080>. Do **not** bake the key into the image.
+
+### 2. Deploy to Cloud Run
+
+Replace `YOUR_PROJECT_ID` with your GCP project id.
+
+```bash
+gcloud config set project YOUR_PROJECT_ID
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com
+
+gcloud run deploy doc-assistant \
+  --source . \
+  --region asia-south1 \
+  --allow-unauthenticated \
+  --memory 2Gi \
+  --cpu 2 \
+  --timeout 300 \
+  --set-env-vars GROQ_API_KEY=gsk_your_key_here
+```
+
+`--source .` builds the `Dockerfile` in Cloud Build and deploys it. Use **2Gi** memory: `torch` and embeddings will crash a 512Mi instance.
+
+When it finishes, Cloud Run prints a URL like `https://doc-assistant-xxxxx-el.a.run.app`.
+
+### 3. Alternative: Compute Engine VM (closer to a classic VM)
+
+1. GCP Console → **Compute Engine** → **Create instance**.
+2. Machine type: **e2-medium** (2 vCPU / 4 GB).
+3. Boot disk: 20 GB.
+4. Firewall: allow HTTP (or open tcp:8080).
+5. SSH in, install Docker, clone the repo, then:
+
+```bash
+docker build -t doc-assistant .
+docker run -d --name doc-assistant --restart unless-stopped \
+  -p 8080:8080 \
+  -e GROQ_API_KEY="gsk_your_key_here" \
+  doc-assistant
+```
+
+Open `http://<VM_EXTERNAL_IP>:8080`.
+
+### 4. How to describe this in a report / viva
+
+> The RAG chatbot is containerized with Docker and deployed on **Google Cloud Run**. Users reach it over HTTPS. Embeddings and FAISS run in the container. The LLM is **Groq** (cloud API). The API key is injected as a Cloud Run environment variable, not stored in Git.
 
 ## Notes on `.streamlit/config.toml` and `$PORT`
 
